@@ -1,10 +1,12 @@
 """
 交易策略模块
-包含：配对交易策略 + 回测引擎 + 方法对比
+包含：配对交易策略 (实盘增强版 v3.2)
+集成：Rolling Cointegration Check + 双腿P&L + 硬止损
 """
 
 import numpy as np
 import pandas as pd
+from statsmodels.tsa.stattools import coint  # <--- 新增引用：用于滚动检验
 from core_analysis import AdaptiveZScoreCalculator
 from config import (
     DEFAULT_Z_ENTRY, DEFAULT_Z_EXIT, DEFAULT_LOOKBACK,
@@ -14,10 +16,20 @@ from config import (
     Z_SCORE_STOP_THRESHOLD, MAX_HOLDING_DAYS
 )
 
+# ==================== 风控配置 ====================
+MAX_DRAWDOWN_STOP = 0.15      # 15% 最大回撤硬止损
+SLIPPAGE = 0.0005             # 万分之五滑点 (双向)
+ROLLING_CHECK_INTERVAL = 20   # 每20个交易日检查一次协整性
+ROLLING_CHECK_WINDOW = 120    # 检查时使用过去120天的数据
+ROLLING_P_VALUE_THRESHOLD = 0.10 # P值大于0.1则认为关系破裂
 
 class PriceRatioPairsTrading:
     """
-    配对交易策略 v3.0 - 使用价格比 + 支持双Z-score方法
+    配对交易策略 v3.2 - 实盘增强版
+    特性: 
+    1. 双腿交易 (Dual Leg Execution)
+    2. 硬止损 (Hard Drawdown Stop)
+    3. 滚动协整检查 (Rolling Cointegration Check)
     """
     
     def __init__(self, prices, stock1, stock2, 
@@ -27,21 +39,10 @@ class PriceRatioPairsTrading:
                  initial_capital=DEFAULT_INITIAL_CAPITAL, 
                  transaction_cost=DEFAULT_TRANSACTION_COST,
                  allow_short=DEFAULT_ALLOW_SHORT, 
-                 zscore_method=DEFAULT_ZSCORE_METHOD):
+                 zscore_method=DEFAULT_ZSCORE_METHOD,
+                 hedge_ratio=1.0): 
         """
         初始化策略
-        
-        参数:
-            prices: pd.DataFrame - 包含stock1和stock2的价格数据
-            stock1: str - 股票1代码
-            stock2: str - 股票2代码
-            z_entry: float - 入场Z-score阈值
-            z_exit: float - 出场Z-score阈值
-            lookback: int - Z-score计算窗口
-            initial_capital: float - 初始资金
-            transaction_cost: float - 交易成本比例
-            allow_short: bool - 是否允许做空
-            zscore_method: str - Z-score计算方法：'traditional'或'robust'
         """
         self.prices = prices[[stock1, stock2]].dropna().copy()
         self.stock1 = stock1
@@ -53,6 +54,7 @@ class PriceRatioPairsTrading:
         self.transaction_cost = transaction_cost
         self.allow_short = allow_short
         self.zscore_method = zscore_method
+        self.hedge_ratio = hedge_ratio
         
         # 记录交易信号
         self.signals = []
@@ -74,139 +76,182 @@ class PriceRatioPairsTrading:
         
         # 去掉NaN
         self.prices = self.prices.dropna()
-        
-        # 验证数据质量
-        if len(self.prices) == 0:
-            raise ValueError("计算指标后数据为空，请检查输入数据")
-        
-        z_min = self.prices['z_score'].min()
-        z_max = self.prices['z_score'].max()
-        
-        # 警告极端Z-score值
-        if abs(z_min) > 20 or abs(z_max) > 20:
-            print(f"    ⚠️ Z-score异常: [{z_min:.1f}, {z_max:.1f}]")
     
     def backtest(self):
         """
-        回测策略
-        
-        返回:
-            dict: 回测结果
+        执行回测 (包含滚动检查与资金管理)
         """
         print(f"\n{'='*60}")
-        print(f"回测: {self.stock1} - {self.stock2}")
-        print(f"方法: {self.zscore_method.upper()} Z-score")
-        print(f"数据: {len(self.prices)}天 ({self.prices.index[0].date()} ~ {self.prices.index[-1].date()})")
-        print(f"Z-score范围: [{self.prices['z_score'].min():.2f}, {self.prices['z_score'].max():.2f}]")
+        print(f"实盘级回测: {self.stock1} vs {self.stock2}")
+        print(f"模式: 双腿交易 + 滚动协整检查")
         print(f"{'='*60}\n")
         
-        # 初始化
         capital = self.initial_capital
-        position = 0  # 0=空仓, 1=做多价格比, -1=做空价格比
-        entry_ratio = 0
+        max_capital = capital  # 用于计算回撤
+        
+        # 仓位状态
+        position = 0  # 0=空仓, 1=做多比率(Long A/Short B), -1=做空比率(Short A/Long B)
+        
+        # 记录入场时的价格和股数
+        entry_price_1 = 0
+        entry_price_2 = 0
+        shares_1 = 0
+        shares_2 = 0
         entry_date = None
+        entry_z = 0
+        
+        # 协整状态追踪
+        is_relationship_valid = True
+        next_check_day = ROLLING_CHECK_WINDOW  # 从数据足够长时开始检查
         
         trades = []
         equity_curve = [capital]
-        
-        # 重置信号列表
         self.signals = []
         
         # 遍历每一天
         for i in range(len(self.prices)):
             current = self.prices.iloc[i]
-            z_score = current['z_score']
-            ratio = current['ratio']
             date = self.prices.index[i]
             
-            # ===== 异常保护 =====
+            p1 = current[self.stock1]
+            p2 = current[self.stock2]
+            z_score = current['z_score']
+            ratio = current['ratio']
             
-            # Z-score爆炸保护
-            if abs(z_score) > Z_SCORE_EXPLOSION_THRESHOLD:
-                if position != 0:
-                    # 强制平仓
-                    pnl_ratio = position * (ratio - entry_ratio) / entry_ratio
-                    pnl_ratio = np.clip(pnl_ratio, -MAX_SINGLE_PNL_RATIO, MAX_SINGLE_PNL_RATIO)
-                    pnl = capital * pnl_ratio
-                    capital += pnl
+            # ===== 1. 🛡️ 滚动协整检查 (防假死机制) =====
+            # 定期检查关系是否还存在
+            if i >= ROLLING_CHECK_WINDOW and i == next_check_day:
+                # 提取过去一段窗口的数据
+                history_s1 = self.prices[self.stock1].iloc[i-ROLLING_CHECK_WINDOW:i]
+                history_s2 = self.prices[self.stock2].iloc[i-ROLLING_CHECK_WINDOW:i]
+                
+                try:
+                    # 快速跑一个EG检验 (只看P-value)
+                    _, p_value, _ = coint(history_s1, history_s2)
                     
-                    trades.append({
-                        'Entry Date': entry_date,
-                        'Exit Date': date,
-                        'Position': 'Long Ratio' if position == 1 else 'Short Ratio',
-                        'Entry Ratio': entry_ratio,
-                        'Exit Ratio': ratio,
-                        'Entry Z': self.prices.loc[entry_date, 'z_score'],
-                        'Exit Z': z_score,
-                        'P&L': pnl,
-                        'P&L %': pnl_ratio * 100,
-                        'Days': (date - entry_date).days,
-                        'Exit Reason': 'Emergency Exit (Z爆炸)'
-                    })
-                    
-                    self.signals.append({
-                        'date': date,
-                        'type': 'emergency_exit',
-                        'position': position,
-                        'z_score': z_score,
-                        'ratio': ratio
-                    })
-                    
-                    position = 0
+                    if p_value > ROLLING_P_VALUE_THRESHOLD:
+                        is_relationship_valid = False
+                        # 记录警报信号
+                        self.signals.append({
+                            'date': date, 'type': 'relationship_broken', 
+                            'position': position, 'ratio': ratio, 'z_score': z_score,
+                            'note': f'P-val:{p_value:.3f} (失效)'
+                        })
+                    else:
+                        is_relationship_valid = True
+                        if not is_relationship_valid: # 如果之前是失效的，现在恢复了
+                             self.signals.append({
+                                'date': date, 'type': 'relationship_restored', 
+                                'position': position, 'ratio': ratio, 'z_score': z_score,
+                                'note': f'P-val:{p_value:.3f} (恢复)'
+                            })
+                except:
+                    is_relationship_valid = False # 计算出错默认失效
+                
+                next_check_day += ROLLING_CHECK_INTERVAL # 设定下一次检查时间
+            
+            # ===== 2. 💰 实时市值与回撤计算 =====
+            current_equity = capital
+            if position != 0:
+                floating_pnl = self._calculate_pnl(
+                    position, shares_1, shares_2, 
+                    entry_price_1, entry_price_2, 
+                    p1, p2
+                )
+                current_equity += floating_pnl
+
+            # 更新最大回撤
+            max_capital = max(max_capital, current_equity)
+            drawdown = (max_capital - current_equity) / max_capital if max_capital > 0 else 0
+            equity_curve.append(current_equity)
+
+            # ===== 3. 🚨 硬风控 (Hard Risk Control) =====
+            
+            # A. 爆仓保护
+            if current_equity <= 0:
+                print(f"  ❌ 账户爆仓于 {date.date()}")
+                break
+                
+            # B. 最大回撤硬止损
+            if position != 0 and drawdown > MAX_DRAWDOWN_STOP:
+                realized_pnl = self._calculate_pnl(position, shares_1, shares_2, entry_price_1, entry_price_2, p1, p2)
+                capital += realized_pnl
+                capital -= self._calculate_cost(shares_1, p1, shares_2, p2)
+                
+                self._record_trade(trades, entry_date, date, position, entry_z, z_score, realized_pnl, "Hard Stop (Drawdown)")
+                self.signals.append({'date': date, 'type': 'emergency_exit', 'position': position, 'ratio': ratio, 'z_score': z_score})
+                position = 0
+                continue 
+
+            # C. Z-score 爆炸保护
+            if abs(z_score) > Z_SCORE_EXPLOSION_THRESHOLD and position != 0:
+                realized_pnl = self._calculate_pnl(position, shares_1, shares_2, entry_price_1, entry_price_2, p1, p2)
+                capital += realized_pnl
+                capital -= self._calculate_cost(shares_1, p1, shares_2, p2)
+                
+                self._record_trade(trades, entry_date, date, position, entry_z, z_score, realized_pnl, "Z-Score Explosion")
+                self.signals.append({'date': date, 'type': 'emergency_exit', 'position': position, 'ratio': ratio, 'z_score': z_score})
+                position = 0
                 continue
             
-            # 爆仓保护
-            if capital <= 0:
-                print(f"  ⚠️ 爆仓！资金={capital:.2f}")
-                break
+            # ===== 4. 📈 交易逻辑 =====
             
-            # ===== 入场逻辑 =====
+            # 入场逻辑
             if position == 0:
-                
-                # 做空价格比 (Z > +2.0)
-                if z_score > self.z_entry and self.allow_short:
-                    position = -1
-                    entry_ratio = ratio
-                    entry_date = date
-                    capital *= (1 - self.transaction_cost)  # 入场交易成本
+                # 核心修改：只有关系有效 (is_relationship_valid) 才允许开仓
+                if is_relationship_valid:
                     
-                    self.signals.append({
-                        'date': date,
-                        'type': 'short_entry',
-                        'position': -1,
-                        'z_score': z_score,
-                        'ratio': ratio
-                    })
-                
-                # 做多价格比 (Z < -2.0)
-                elif z_score < -self.z_entry:
-                    position = 1
-                    entry_ratio = ratio
-                    entry_date = date
-                    capital *= (1 - self.transaction_cost)  # 入场交易成本
+                    # 做空价格比 (Short Ratio)
+                    if z_score > self.z_entry and self.allow_short:
+                        position = -1
+                        entry_date = date
+                        entry_price_1 = p1
+                        entry_price_2 = p2
+                        entry_z = z_score
+                        
+                        # 资金分配 (保留5%现金)
+                        trade_capital = capital * 0.95
+                        allocation = trade_capital / 2
+                        
+                        shares_1 = allocation / p1  # 卖空 A
+                        shares_2 = allocation / p2  # 买入 B
+                        
+                        capital -= self._calculate_cost(shares_1, p1, shares_2, p2)
+                        
+                        self.signals.append({'date': date, 'type': 'short_entry', 'position': -1, 'ratio': ratio, 'z_score': z_score})
                     
-                    self.signals.append({
-                        'date': date,
-                        'type': 'long_entry',
-                        'position': 1,
-                        'z_score': z_score,
-                        'ratio': ratio
-                    })
+                    # 做多价格比 (Long Ratio)
+                    elif z_score < -self.z_entry:
+                        position = 1
+                        entry_date = date
+                        entry_price_1 = p1
+                        entry_price_2 = p2
+                        entry_z = z_score
+                        
+                        trade_capital = capital * 0.95
+                        allocation = trade_capital / 2
+                        
+                        shares_1 = allocation / p1  # 买入 A
+                        shares_2 = allocation / p2  # 卖空 B
+                        
+                        capital -= self._calculate_cost(shares_1, p1, shares_2, p2)
+                        
+                        self.signals.append({'date': date, 'type': 'long_entry', 'position': 1, 'ratio': ratio, 'z_score': z_score})
             
-            # ===== 出场逻辑 =====
+            # 出场逻辑
             elif position != 0:
                 should_exit = False
                 exit_reason = ""
                 
-                # 1. 正常止盈：Z-score回归
-                if abs(z_score) < self.z_exit:
+                # 1. 关系破裂强制离场 (新增)
+                if not is_relationship_valid:
+                    should_exit = True
+                    exit_reason = "Relationship Broken"
+                
+                # 2. 正常回归
+                elif abs(z_score) < self.z_exit:
                     should_exit = True
                     exit_reason = "Normal Exit"
-                
-                # 2. Z-score爆炸止损
-                elif abs(z_score) > Z_SCORE_STOP_THRESHOLD:
-                    should_exit = True
-                    exit_reason = "Z-Score Explosion"
                 
                 # 3. 时间止损
                 elif (date - entry_date).days > MAX_HOLDING_DAYS:
@@ -214,78 +259,80 @@ class PriceRatioPairsTrading:
                     exit_reason = "Time Stop"
                 
                 if should_exit:
-                    # 计算盈亏
-                    ratio_change = (ratio - entry_ratio) / entry_ratio
-                    pnl_ratio = position * ratio_change
+                    realized_pnl = self._calculate_pnl(position, shares_1, shares_2, entry_price_1, entry_price_2, p1, p2)
+                    capital += realized_pnl
+                    capital -= self._calculate_cost(shares_1, p1, shares_2, p2)
                     
-                    # 限制单笔盈亏在±100%以内
-                    pnl_ratio = np.clip(pnl_ratio, -MAX_SINGLE_PNL_RATIO, MAX_SINGLE_PNL_RATIO)
-                    
-                    pnl = capital * pnl_ratio
-                    capital += pnl
-                    capital *= (1 - self.transaction_cost)  # 出场交易成本
-                    
-                    # 记录交易
-                    trades.append({
-                        'Entry Date': entry_date,
-                        'Exit Date': date,
-                        'Position': 'Long Ratio' if position == 1 else 'Short Ratio',
-                        'Entry Ratio': entry_ratio,
-                        'Exit Ratio': ratio,
-                        'Entry Z': self.prices.loc[entry_date, 'z_score'],
-                        'Exit Z': z_score,
-                        'P&L': pnl,
-                        'P&L %': pnl_ratio * 100,
-                        'Days': (date - entry_date).days,
-                        'Exit Reason': exit_reason
-                    })
-                    
-                    self.signals.append({
-                        'date': date,
-                        'type': 'exit',
-                        'position': position,
-                        'z_score': z_score,
-                        'ratio': ratio,
-                        'reason': exit_reason
-                    })
+                    self._record_trade(trades, entry_date, date, position, entry_z, z_score, realized_pnl, exit_reason)
+                    self.signals.append({'date': date, 'type': 'exit', 'position': position, 'ratio': ratio, 'z_score': z_score, 'reason': exit_reason})
                     
                     position = 0
             
-            # 更新权益曲线
-            equity_curve.append(capital)
-        
-        # ===== 计算统计指标 =====
-        
+        # ===== 5. 生成报告 =====
+        return self._generate_report(trades, equity_curve, capital)
+    
+    def _calculate_pnl(self, position, s1, s2, ep1, ep2, cp1, cp2):
+        """
+        计算双腿盈亏 (绝对金额)
+        """
+        if position == 1:
+            # Long Ratio: Long A, Short B
+            pnl_1 = (cp1 - ep1) * s1
+            pnl_2 = (ep2 - cp2) * s2
+        else:
+            # Short Ratio: Short A, Long B
+            pnl_1 = (ep1 - cp1) * s1
+            pnl_2 = (cp2 - ep2) * s2
+            
+        return pnl_1 + pnl_2
+
+    def _calculate_cost(self, s1, p1, s2, p2):
+        """计算成本: 佣金 + 滑点"""
+        val_1 = s1 * p1
+        val_2 = s2 * p2
+        commission = (val_1 + val_2) * self.transaction_cost
+        slippage = (val_1 + val_2) * SLIPPAGE  # 增加滑点成本
+        return commission + slippage
+
+    def _record_trade(self, trades, entry_date, exit_date, position, entry_z, exit_z, pnl, reason):
+        """记录交易"""
+        trades.append({
+            'Entry Date': entry_date,
+            'Exit Date': exit_date,
+            'Position': 'Long Ratio' if position == 1 else 'Short Ratio',
+            'Entry Z': entry_z,
+            'Exit Z': exit_z,
+            'P&L': pnl,
+            'Days': (exit_date - entry_date).days,
+            'Exit Reason': reason
+        })
+
+    def _generate_report(self, trades, equity_curve, final_capital):
+        """生成统计报告"""
         if len(trades) > 0:
             trades_df = pd.DataFrame(trades)
+            trades_df['P&L %'] = (trades_df['P&L'] / self.initial_capital) * 100
             
-            # 总收益率
-            total_return = (capital - self.initial_capital) / self.initial_capital
+            total_return = (final_capital - self.initial_capital) / self.initial_capital
             
-            # 交易统计
-            num_trades = len(trades_df)
-            winning_trades = len(trades_df[trades_df['P&L'] > 0])
-            win_rate = winning_trades / num_trades if num_trades > 0 else 0
-            
-            # 夏普比率
-            returns = trades_df['P&L %'].values / 100
+            # 计算夏普
+            returns = trades_df['P&L'] / self.initial_capital
             if returns.std() > 0:
-                sharpe = returns.mean() / returns.std() * np.sqrt(252/30)
+                sharpe = returns.mean() / returns.std() * np.sqrt(252/30) # 假设平均持仓30天
             else:
                 sharpe = 0
             
-            # 最大回撤
-            equity_series = pd.Series(equity_curve)
-            cummax = equity_series.cummax()
-            drawdown = (equity_series - cummax) / cummax
-            max_drawdown = drawdown.min()
+            # 计算最大回撤
+            eq_series = pd.Series(equity_curve)
+            cummax = eq_series.cummax()
+            dd = (eq_series - cummax) / cummax
+            max_drawdown = dd.min()
             
-            # 组装结果
-            result = {
+            return {
                 'Total Return': total_return * 100,
-                'Final Capital': capital,
-                'Num Trades': num_trades,
-                'Win Rate': win_rate * 100,
+                'Final Capital': final_capital,
+                'Num Trades': len(trades),
+                'Win Rate': len(trades_df[trades_df['P&L'] > 0]) / len(trades) * 100,
                 'Sharpe Ratio': sharpe,
                 'Max Drawdown': max_drawdown * 100,
                 'Avg Trade': trades_df['P&L %'].mean(),
@@ -296,24 +343,10 @@ class PriceRatioPairsTrading:
                 'Signals': pd.DataFrame(self.signals),
                 'Method': self.zscore_method
             }
-            
-            # 打印摘要
-            print(f"回测完成:")
-            print(f"  总收益: {result['Total Return']:.2f}%")
-            print(f"  夏普比率: {result['Sharpe Ratio']:.2f}")
-            print(f"  交易次数: {result['Num Trades']}")
-            print(f"  胜率: {result['Win Rate']:.1f}%")
-            print(f"  最大回撤: {result['Max Drawdown']:.2f}%")
-            
         else:
-            # 没有交易
-            print("  ⚠️ 没有产生任何交易")
-            result = self._empty_result()
-        
-        return result
-    
+            return self._empty_result()
+
     def _empty_result(self, error=None):
-        """没有交易时的空结果"""
         return {
             'Total Return': 0,
             'Final Capital': self.initial_capital,
@@ -331,6 +364,10 @@ class PriceRatioPairsTrading:
             'Error': error
         }
 
+# ==================== 兼容旧接口 ====================
+# 如果需要保留 compare_methods_and_plot 函数，可以把之前的代码粘贴在这里
+# 但因为逻辑变了（从Ratio交易变成了双腿交易），旧的对比函数可能需要微调才能跑通
+# 建议暂时只用单策略回测
 
 # ==================== 方法对比工具 ====================
 
