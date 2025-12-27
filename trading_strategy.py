@@ -1,11 +1,12 @@
 """
 交易策略模块
-包含：配对交易策略 (实盘增强版 v3.2)
-集成：Rolling Cointegration Check + 双腿P&L + 硬止损
+包含：配对交易策略 (实盘增强版 v4.0)
+集成：Rolling Cointegration Check + 双腿P&L + 硬止损 + 动态对冲比率
 """
 
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint  # <--- 新增引用：用于滚动检验
 from core_analysis import AdaptiveZScoreCalculator
 from config import (
@@ -19,17 +20,26 @@ from config import (
 # ==================== 风控配置 ====================
 MAX_DRAWDOWN_STOP = 0.15      # 15% 最大回撤硬止损
 SLIPPAGE = 0.0005             # 万分之五滑点 (双向)
-ROLLING_CHECK_INTERVAL = 20   # 每20个交易日检查一次协整性
-ROLLING_CHECK_WINDOW = 120    # 检查时使用过去120天的数据
+ROLLING_CHECK_INTERVAL = 5   # 每20个交易日检查一次协整性
+ROLLING_CHECK_WINDOW = 60    # 检查时使用过去120天的数据
 ROLLING_P_VALUE_THRESHOLD = 0.10 # P值大于0.1则认为关系破裂
+
+# ==================== 动态对冲比率配置 ====================
+HEDGE_RATIO_RECALIBRATE_FREQ = 20  # 每20天重新计算一次对冲比率
+HEDGE_RATIO_LOOKBACK = 60          # 计算对冲比率时使用过去60天数据
+HEDGE_RATIO_METHOD = 'ols'         # 'ols' 或 'tls' (Total Least Squares)
+MIN_HEDGE_RATIO = 0.1              # 对冲比率最小值（防止异常）
+MAX_HEDGE_RATIO = 10.0             # 对冲比率最大值（防止异常）
+HEDGE_RATIO_CHANGE_THRESHOLD = 0.3 # 对冲比率变化超过30%时触发预警
 
 class PriceRatioPairsTrading:
     """
-    配对交易策略 v3.2 - 实盘增强版
+    配对交易策略 v4.0 - 实盘增强版
     特性: 
     1. 双腿交易 (Dual Leg Execution)
     2. 硬止损 (Hard Drawdown Stop)
     3. 滚动协整检查 (Rolling Cointegration Check)
+    4. 动态对冲比率 (Dynamic Hedge Ratio) ⭐ NEW
     """
     
     def __init__(self, prices, stock1, stock2, 
@@ -40,9 +50,17 @@ class PriceRatioPairsTrading:
                  transaction_cost=DEFAULT_TRANSACTION_COST,
                  allow_short=DEFAULT_ALLOW_SHORT, 
                  zscore_method=DEFAULT_ZSCORE_METHOD,
-                 hedge_ratio=1.0): 
+                 hedge_ratio=1.0,
+                 dynamic_hedge=True,
+                 hedge_recalibrate_freq=HEDGE_RATIO_RECALIBRATE_FREQ,
+                 hedge_method=HEDGE_RATIO_METHOD): 
         """
         初始化策略
+        
+        新增参数:
+            dynamic_hedge: 是否使用动态对冲比率（默认True）
+            hedge_recalibrate_freq: 对冲比率重新校准频率（天）
+            hedge_method: 对冲比率计算方法 ('ols' 或 'tls')
         """
         self.prices = prices[[stock1, stock2]].dropna().copy()
         self.stock1 = stock1
@@ -54,43 +72,135 @@ class PriceRatioPairsTrading:
         self.transaction_cost = transaction_cost
         self.allow_short = allow_short
         self.zscore_method = zscore_method
-        self.hedge_ratio = hedge_ratio
+        self.hedge_ratio = hedge_ratio  # 初始对冲比率
+        
+        # 动态对冲比率参数
+        self.dynamic_hedge = dynamic_hedge
+        self.hedge_recalibrate_freq = hedge_recalibrate_freq
+        self.hedge_method = hedge_method
         
         # 记录交易信号
         self.signals = []
         
+        # 记录对冲比率历史
+        self.hedge_ratio_history = []
+        
         # 计算指标
         self._calculate_indicators()
     
-    def _calculate_indicators(self):
-        """计算指标"""
-        # 计算价格比
-        self.prices['ratio'] = self.prices[self.stock1] / self.prices[self.stock2]
+    def _calculate_hedge_ratio(self, stock1_prices, stock2_prices, method='ols'):
+        """
+        计算对冲比率
         
-        # 使用AdaptiveZScoreCalculator计算Z-score
-        self.prices['z_score'] = AdaptiveZScoreCalculator.calculate(
-            self.prices['ratio'],
-            lookback=self.lookback,
-            method=self.zscore_method
-        )
+        Args:
+            stock1_prices: 股票1的价格序列
+            stock2_prices: 股票2的价格序列
+            method: 'ols' 或 'tls' (Total Least Squares)
+        
+        Returns:
+            float: 对冲比率 (beta)
+        """
+        if len(stock1_prices) < 20:
+            return self.hedge_ratio  # 数据不足，返回默认值
+        
+        try:
+            if method == 'ols':
+                # 普通最小二乘法: Y = alpha + beta * X
+                X = sm.add_constant(stock2_prices)
+                model = sm.OLS(stock1_prices, X).fit()
+                hedge_ratio = model.params[1]
+                
+            elif method == 'tls':
+                # Total Least Squares (更稳健，考虑X和Y的误差)
+                # 使用主成分分析实现TLS
+                from scipy.linalg import svd
+                
+                # 标准化数据
+                X = np.array(stock2_prices).reshape(-1, 1)
+                Y = np.array(stock1_prices).reshape(-1, 1)
+                
+                X_mean = X.mean()
+                Y_mean = Y.mean()
+                
+                data = np.hstack([X - X_mean, Y - Y_mean])
+                
+                # SVD分解
+                U, S, Vt = svd(data, full_matrices=False)
+                
+                # TLS解（第二个主成分的斜率）
+                V = Vt.T
+                hedge_ratio = -V[0, 1] / V[0, 0]
+            
+            else:
+                hedge_ratio = self.hedge_ratio
+            
+            # 应用合理性检查
+            if hedge_ratio < MIN_HEDGE_RATIO or hedge_ratio > MAX_HEDGE_RATIO:
+                return self.hedge_ratio  # 超出合理范围，使用默认值
+            
+            return hedge_ratio
+            
+        except Exception as e:
+            # 计算失败，返回默认值
+            return self.hedge_ratio
+    
+    def _should_recalibrate_hedge(self, current_day, last_calibration_day):
+        """判断是否需要重新校准对冲比率"""
+        return (current_day - last_calibration_day) >= self.hedge_recalibrate_freq
+    
+    def _calculate_spread_with_dynamic_hedge(self, stock1_price, stock2_price, hedge_ratio):
+        """使用动态对冲比率计算价差"""
+        return stock1_price - hedge_ratio * stock2_price
+    
+    def _calculate_indicators(self):
+        """
+        计算指标
+        
+        注意：如果使用动态对冲比率，price ratio和z-score会在回测中实时计算
+        这里只计算固定对冲比率版本作为参考
+        """
+        if not self.dynamic_hedge:
+            # 固定对冲比率模式：预先计算所有指标
+            self.prices['ratio'] = self.prices[self.stock1] / self.prices[self.stock2]
+            
+            self.prices['z_score'] = AdaptiveZScoreCalculator.calculate(
+                self.prices['ratio'],
+                lookback=self.lookback,
+                method=self.zscore_method
+            )
+        else:
+            # 动态对冲比率模式：在回测中逐步计算
+            # 这里先计算初始对冲比率
+            if len(self.prices) >= HEDGE_RATIO_LOOKBACK:
+                self.hedge_ratio = self._calculate_hedge_ratio(
+                    self.prices[self.stock1].iloc[:HEDGE_RATIO_LOOKBACK],
+                    self.prices[self.stock2].iloc[:HEDGE_RATIO_LOOKBACK],
+                    method=self.hedge_method
+                )
+            
+            # 计算初始价差（使用初始对冲比率）
+            self.prices['spread'] = (self.prices[self.stock1] - 
+                                    self.hedge_ratio * self.prices[self.stock2])
         
         # 去掉NaN
         self.prices = self.prices.dropna()
     
     def backtest(self):
         """
-        执行回测 (包含滚动检查与资金管理)
+        执行回测 (包含滚动检查、资金管理、动态对冲比率)
         """
         print(f"\n{'='*60}")
         print(f"实盘级回测: {self.stock1} vs {self.stock2}")
-        print(f"模式: 双腿交易 + 滚动协整检查")
+        print(f"模式: 双腿交易 + 滚动协整检查 + {'动态对冲比率' if self.dynamic_hedge else '固定对冲比率'}")
+        if self.dynamic_hedge:
+            print(f"对冲比率更新频率: 每{self.hedge_recalibrate_freq}天 ({self.hedge_method.upper()}方法)")
         print(f"{'='*60}\n")
         
         capital = self.initial_capital
         max_capital = capital  # 用于计算回撤
         
         # 仓位状态
-        position = 0  # 0=空仓, 1=做多比率(Long A/Short B), -1=做空比率(Short A/Long B)
+        position = 0  # 0=空仓, 1=做多价差, -1=做空价差
         
         # 记录入场时的价格和股数
         entry_price_1 = 0
@@ -99,14 +209,20 @@ class PriceRatioPairsTrading:
         shares_2 = 0
         entry_date = None
         entry_z = 0
+        entry_hedge_ratio = self.hedge_ratio  # 记录入场时的对冲比率
         
         # 协整状态追踪
         is_relationship_valid = True
-        next_check_day = ROLLING_CHECK_WINDOW  # 从数据足够长时开始检查
+        next_check_day = ROLLING_CHECK_WINDOW
+        
+        # 动态对冲比率追踪
+        current_hedge_ratio = self.hedge_ratio
+        last_hedge_calibration_day = 0
         
         trades = []
         equity_curve = [capital]
         self.signals = []
+        self.hedge_ratio_history = []
         
         # 遍历每一天
         for i in range(len(self.prices)):
@@ -115,23 +231,85 @@ class PriceRatioPairsTrading:
             
             p1 = current[self.stock1]
             p2 = current[self.stock2]
-            z_score = current['z_score']
-            ratio = current['ratio']
             
-            # ===== 1. 🛡️ 滚动协整检查 (防假死机制) =====
-            # 定期检查关系是否还存在
+            # ===== 1. 🔄 动态对冲比率更新 =====
+            if self.dynamic_hedge and i >= HEDGE_RATIO_LOOKBACK:
+                # 检查是否需要重新校准
+                if self._should_recalibrate_hedge(i, last_hedge_calibration_day):
+                    # 使用过去HEDGE_RATIO_LOOKBACK天的数据计算新对冲比率
+                    lookback_start = max(0, i - HEDGE_RATIO_LOOKBACK)
+                    history_s1 = self.prices[self.stock1].iloc[lookback_start:i]
+                    history_s2 = self.prices[self.stock2].iloc[lookback_start:i]
+                    
+                    old_hedge_ratio = current_hedge_ratio
+                    new_hedge_ratio = self._calculate_hedge_ratio(
+                        history_s1, history_s2, method=self.hedge_method
+                    )
+                    
+                    # 检查对冲比率变化幅度
+                    hedge_ratio_change = abs(new_hedge_ratio - old_hedge_ratio) / old_hedge_ratio
+                    
+                    if hedge_ratio_change > HEDGE_RATIO_CHANGE_THRESHOLD:
+                        # 对冲比率变化超过阈值，记录预警
+                        self.signals.append({
+                            'date': date,
+                            'type': 'hedge_ratio_warning',
+                            'old_hedge': old_hedge_ratio,
+                            'new_hedge': new_hedge_ratio,
+                            'change_pct': hedge_ratio_change * 100,
+                            'note': f'对冲比率大幅变化: {old_hedge_ratio:.3f} → {new_hedge_ratio:.3f}'
+                        })
+                    
+                    current_hedge_ratio = new_hedge_ratio
+                    last_hedge_calibration_day = i
+                    
+                    # 记录对冲比率历史
+                    self.hedge_ratio_history.append({
+                        'date': date,
+                        'hedge_ratio': current_hedge_ratio,
+                        'method': self.hedge_method
+                    })
+            
+            # 使用当前对冲比率计算价差和z-score
+            if self.dynamic_hedge:
+                # 动态模式：使用当前对冲比率计算价差
+                spread = self._calculate_spread_with_dynamic_hedge(p1, p2, current_hedge_ratio)
+                
+                # 计算z-score（使用过去lookback天的价差）
+                if i >= self.lookback:
+                    lookback_start = max(0, i - self.lookback)
+                    
+                    # 重新计算历史价差（使用当前对冲比率）
+                    hist_p1 = self.prices[self.stock1].iloc[lookback_start:i+1]
+                    hist_p2 = self.prices[self.stock2].iloc[lookback_start:i+1]
+                    hist_spread = hist_p1 - current_hedge_ratio * hist_p2
+                    
+                    # 计算z-score
+                    z_score = AdaptiveZScoreCalculator.calculate(
+                        hist_spread,
+                        lookback=self.lookback,
+                        method=self.zscore_method
+                    ).iloc[-1]
+                else:
+                    z_score = 0  # 数据不足
+                
+                ratio = p1 / p2  # 仅用于记录
+            else:
+                # 固定模式：使用预计算的ratio和z-score
+                z_score = current.get('z_score', 0)
+                ratio = current.get('ratio', p1/p2)
+            
+            # ===== 2. 🛡️ 滚动协整检查 =====
             if i >= ROLLING_CHECK_WINDOW and i == next_check_day:
-                # 提取过去一段窗口的数据
                 history_s1 = self.prices[self.stock1].iloc[i-ROLLING_CHECK_WINDOW:i]
                 history_s2 = self.prices[self.stock2].iloc[i-ROLLING_CHECK_WINDOW:i]
                 
                 try:
-                    # 快速跑一个EG检验 (只看P-value)
                     _, p_value, _ = coint(history_s1, history_s2)
                     
                     if p_value > ROLLING_P_VALUE_THRESHOLD:
                         is_relationship_valid = False
-                        # 记录警报信号
+                        print(f"  ⚠️ {date.date()}: 协整破裂 p={p_value:.4f}")  # ← 加在这里！
                         self.signals.append({
                             'date': date, 'type': 'relationship_broken', 
                             'position': position, 'ratio': ratio, 'z_score': z_score,
@@ -139,18 +317,20 @@ class PriceRatioPairsTrading:
                         })
                     else:
                         is_relationship_valid = True
-                        if not is_relationship_valid: # 如果之前是失效的，现在恢复了
+                        print(f"  ✅ {date.date()}: 协整有效 p={p_value:.4f}")  
+                        if not is_relationship_valid:
                              self.signals.append({
                                 'date': date, 'type': 'relationship_restored', 
                                 'position': position, 'ratio': ratio, 'z_score': z_score,
                                 'note': f'P-val:{p_value:.3f} (恢复)'
                             })
                 except:
-                    is_relationship_valid = False # 计算出错默认失效
+                    is_relationship_valid = False
+                    print(f"  ❌ {date.date()}: 协整检查失败")  # ← 也可以加这行
                 
-                next_check_day += ROLLING_CHECK_INTERVAL # 设定下一次检查时间
+                next_check_day += ROLLING_CHECK_INTERVAL
             
-            # ===== 2. 💰 实时市值与回撤计算 =====
+            # ===== 3. 💰 实时市值与回撤计算 =====
             current_equity = capital
             if position != 0:
                 floating_pnl = self._calculate_pnl(
@@ -160,7 +340,6 @@ class PriceRatioPairsTrading:
                 )
                 current_equity += floating_pnl
 
-            # 更新最大回撤
             max_capital = max(max_capital, current_equity)
             drawdown = (max_capital - current_equity) / max_capital if max_capital > 0 else 0
             equity_curve.append(current_equity)
@@ -176,7 +355,11 @@ class PriceRatioPairsTrading:
             if position != 0 and drawdown > MAX_DRAWDOWN_STOP:
                 realized_pnl = self._calculate_pnl(position, shares_1, shares_2, entry_price_1, entry_price_2, p1, p2)
                 capital += realized_pnl
-                capital -= self._calculate_cost(shares_1, p1, shares_2, p2)
+                
+                # 扣除完整交易成本：开仓 + 平仓
+                entry_cost = self._calculate_cost(shares_1, entry_price_1, shares_2, entry_price_2)
+                exit_cost = self._calculate_cost(shares_1, p1, shares_2, p2)
+                capital -= (entry_cost + exit_cost)
                 
                 self._record_trade(trades, entry_date, date, position, entry_z, z_score, realized_pnl, "Hard Stop (Drawdown)")
                 self.signals.append({'date': date, 'type': 'emergency_exit', 'position': position, 'ratio': ratio, 'z_score': z_score})
@@ -187,7 +370,11 @@ class PriceRatioPairsTrading:
             if abs(z_score) > Z_SCORE_EXPLOSION_THRESHOLD and position != 0:
                 realized_pnl = self._calculate_pnl(position, shares_1, shares_2, entry_price_1, entry_price_2, p1, p2)
                 capital += realized_pnl
-                capital -= self._calculate_cost(shares_1, p1, shares_2, p2)
+                
+                # 扣除完整交易成本：开仓 + 平仓
+                entry_cost = self._calculate_cost(shares_1, entry_price_1, shares_2, entry_price_2)
+                exit_cost = self._calculate_cost(shares_1, p1, shares_2, p2)
+                capital -= (entry_cost + exit_cost)
                 
                 self._record_trade(trades, entry_date, date, position, entry_z, z_score, realized_pnl, "Z-Score Explosion")
                 self.signals.append({'date': date, 'type': 'emergency_exit', 'position': position, 'ratio': ratio, 'z_score': z_score})
@@ -198,45 +385,66 @@ class PriceRatioPairsTrading:
             
             # 入场逻辑
             if position == 0:
-                # 核心修改：只有关系有效 (is_relationship_valid) 才允许开仓
-                if is_relationship_valid:
+                # 核心修改：只有关系有效才允许开仓
+                if is_relationship_valid and i >= self.lookback:
                     
-                    # 做空价格比 (Short Ratio)
+                    # 做空价差 (价差过高，预期回归)
                     if z_score > self.z_entry and self.allow_short:
                         position = -1
                         entry_date = date
                         entry_price_1 = p1
                         entry_price_2 = p2
                         entry_z = z_score
+                        entry_hedge_ratio = current_hedge_ratio  # 记录入场时的对冲比率
                         
                         # 资金分配 (保留5%现金)
                         trade_capital = capital * 0.95
-                        allocation = trade_capital / 2
                         
-                        shares_1 = allocation / p1  # 卖空 A
-                        shares_2 = allocation / p2  # 买入 B
+                        if self.dynamic_hedge:
+                            # 动态对冲：按对冲比率分配资金
+                            # 价差 = S1 - beta*S2，做空价差 = 卖空S1 + 买入beta*S2
+                            # 总价值 = p1 + beta*p2
+                            total_value = p1 + current_hedge_ratio * p2
+                            shares_1 = trade_capital / total_value  # 卖空S1
+                            shares_2 = shares_1 * current_hedge_ratio  # 买入beta单位S2
+                        else:
+                            # 固定比率：50/50分配
+                            allocation = trade_capital / 2
+                            shares_1 = allocation / p1
+                            shares_2 = allocation / p2
                         
-                        capital -= self._calculate_cost(shares_1, p1, shares_2, p2)
-                        
-                        self.signals.append({'date': date, 'type': 'short_entry', 'position': -1, 'ratio': ratio, 'z_score': z_score})
+                        self.signals.append({
+                            'date': date, 'type': 'short_entry', 
+                            'position': -1, 'ratio': ratio, 'z_score': z_score,
+                            'hedge_ratio': current_hedge_ratio
+                        })
                     
-                    # 做多价格比 (Long Ratio)
+                    # 做多价差 (价差过低，预期回升)
                     elif z_score < -self.z_entry:
                         position = 1
                         entry_date = date
                         entry_price_1 = p1
                         entry_price_2 = p2
                         entry_z = z_score
+                        entry_hedge_ratio = current_hedge_ratio
                         
                         trade_capital = capital * 0.95
-                        allocation = trade_capital / 2
                         
-                        shares_1 = allocation / p1  # 买入 A
-                        shares_2 = allocation / p2  # 卖空 B
+                        if self.dynamic_hedge:
+                            # 做多价差 = 买入S1 + 卖空beta*S2
+                            total_value = p1 + current_hedge_ratio * p2
+                            shares_1 = trade_capital / total_value
+                            shares_2 = shares_1 * current_hedge_ratio
+                        else:
+                            allocation = trade_capital / 2
+                            shares_1 = allocation / p1
+                            shares_2 = allocation / p2
                         
-                        capital -= self._calculate_cost(shares_1, p1, shares_2, p2)
-                        
-                        self.signals.append({'date': date, 'type': 'long_entry', 'position': 1, 'ratio': ratio, 'z_score': z_score})
+                        self.signals.append({
+                            'date': date, 'type': 'long_entry', 
+                            'position': 1, 'ratio': ratio, 'z_score': z_score,
+                            'hedge_ratio': current_hedge_ratio
+                        })
             
             # 出场逻辑
             elif position != 0:
@@ -261,7 +469,11 @@ class PriceRatioPairsTrading:
                 if should_exit:
                     realized_pnl = self._calculate_pnl(position, shares_1, shares_2, entry_price_1, entry_price_2, p1, p2)
                     capital += realized_pnl
-                    capital -= self._calculate_cost(shares_1, p1, shares_2, p2)
+                    
+                    # 扣除完整交易成本：开仓成本 + 平仓成本（共4条腿）
+                    entry_cost = self._calculate_cost(shares_1, entry_price_1, shares_2, entry_price_2)
+                    exit_cost = self._calculate_cost(shares_1, p1, shares_2, p2)
+                    capital -= (entry_cost + exit_cost)
                     
                     self._record_trade(trades, entry_date, date, position, entry_z, z_score, realized_pnl, exit_reason)
                     self.signals.append({'date': date, 'type': 'exit', 'position': position, 'ratio': ratio, 'z_score': z_score, 'reason': exit_reason})
@@ -287,12 +499,81 @@ class PriceRatioPairsTrading:
         return pnl_1 + pnl_2
 
     def _calculate_cost(self, s1, p1, s2, p2):
-        """计算成本: 佣金 + 滑点"""
+        """
+        计算IBKR阶梯式交易成本
+        
+        成本构成:
+        1. 佣金（阶梯式，按股数）
+        2. SEC监管费（仅卖出）
+        3. FINRA/TAF费用（仅卖出）
+        4. 市场冲击（隐性成本）
+        
+        IBKR美股阶梯式计费:
+        - 0-300K股/月: $0.0035/股
+        - 300K-3M股/月: $0.0020/股
+        - 最低佣金: $0.35/单
+        - 最高佣金: 交易额的1%
+        """
+        # ===== 1. 计算两腿的佣金 =====
+        commission_1 = self._calculate_ibkr_commission(s1, p1)
+        commission_2 = self._calculate_ibkr_commission(s2, p2)
+        total_commission = commission_1 + commission_2
+        
+        # ===== 2. SEC + FINRA监管费用（仅卖出时收取）=====
+        # SEC费用: $27.80 per $1M (0.00278%)
+        # FINRA/TAF: $0.166 per $1K (0.0166%)
         val_1 = s1 * p1
         val_2 = s2 * p2
-        commission = (val_1 + val_2) * self.transaction_cost
-        slippage = (val_1 + val_2) * SLIPPAGE  # 增加滑点成本
-        return commission + slippage
+        
+        sec_fee_rate = 0.0000278
+        finra_taf_rate = 0.000166
+        
+        # 假设这是平仓操作，两腿都会有一个卖出
+        # 实际中应该根据position判断哪一腿是卖出
+        regulatory_fees = (val_1 + val_2) * (sec_fee_rate + finra_taf_rate) * 0.5  # 平均50%的腿是卖出
+        
+        # ===== 3. 滑点（原有逻辑保留）=====
+        # 注意：滑点已经包含了市场冲击的影响，不需要重复计算
+        slippage = (val_1 + val_2) * SLIPPAGE
+        
+        # 总成本
+        total_cost = total_commission + regulatory_fees + slippage
+        
+        return total_cost
+    
+    def _calculate_ibkr_commission(self, shares, price):
+        """
+        IBKR阶梯式佣金计算（单腿）
+        
+        阶梯费率（美股）:
+        - 0-300,000股/月: $0.0035/股
+        - 300,000-3,000,000股/月: $0.0020/股
+        - 3,000,000-20,000,000股/月: $0.0015/股
+        - 20,000,000-100,000,000股/月: $0.0010/股
+        - >100,000,000股/月: $0.0005/股
+        
+        限制:
+        - 最低佣金: $0.35/单
+        - 最高佣金: 交易额的1%
+        """
+        trade_value = shares * price
+        
+        # 简化处理：假设散户月交易量 < 300K股，使用最高档费率
+        # 如果需要精确跟踪月累计量，需要添加状态管理
+        commission_rate = 0.0035  # $0.0035/股
+        
+        # 基础佣金
+        commission = shares * commission_rate
+        
+        # 应用最低佣金限制
+        min_commission = 0.35
+        commission = max(commission, min_commission)
+        
+        # 应用最高佣金限制（不超过交易额1%）
+        max_commission = trade_value * 0.01
+        commission = min(commission, max_commission)
+        
+        return commission
 
     def _record_trade(self, trades, entry_date, exit_date, position, entry_z, exit_z, pnl, reason):
         """记录交易"""
@@ -328,7 +609,10 @@ class PriceRatioPairsTrading:
             dd = (eq_series - cummax) / cummax
             max_drawdown = dd.min()
             
-            return {
+            # 准备对冲比率历史数据
+            hedge_ratio_df = pd.DataFrame(self.hedge_ratio_history) if self.hedge_ratio_history else pd.DataFrame()
+            
+            result = {
                 'Total Return': total_return * 100,
                 'Final Capital': final_capital,
                 'Num Trades': len(trades),
@@ -341,8 +625,24 @@ class PriceRatioPairsTrading:
                 'Equity Curve': equity_curve,
                 'Trades': trades_df,
                 'Signals': pd.DataFrame(self.signals),
-                'Method': self.zscore_method
+                'Method': self.zscore_method,
+                'Dynamic Hedge': self.dynamic_hedge,
+                'Hedge Ratio History': hedge_ratio_df
             }
+            
+            # 如果使用了动态对冲比率，添加统计信息
+            if self.dynamic_hedge and len(hedge_ratio_df) > 0:
+                result['Hedge Ratio Stats'] = {
+                    'Initial': hedge_ratio_df['hedge_ratio'].iloc[0] if len(hedge_ratio_df) > 0 else self.hedge_ratio,
+                    'Final': hedge_ratio_df['hedge_ratio'].iloc[-1] if len(hedge_ratio_df) > 0 else self.hedge_ratio,
+                    'Mean': hedge_ratio_df['hedge_ratio'].mean(),
+                    'Std': hedge_ratio_df['hedge_ratio'].std(),
+                    'Min': hedge_ratio_df['hedge_ratio'].min(),
+                    'Max': hedge_ratio_df['hedge_ratio'].max(),
+                    'Num Updates': len(hedge_ratio_df)
+                }
+            
+            return result
         else:
             return self._empty_result()
 
@@ -361,6 +661,8 @@ class PriceRatioPairsTrading:
             'Trades': pd.DataFrame(),
             'Signals': pd.DataFrame(),
             'Method': self.zscore_method,
+            'Dynamic Hedge': self.dynamic_hedge,
+            'Hedge Ratio History': pd.DataFrame(),
             'Error': error
         }
 
@@ -459,3 +761,4 @@ def compare_methods_and_plot(prices, stock1, stock2,
         'strategy_trad': strategy_trad,
         'strategy_robust': strategy_robust
     }
+

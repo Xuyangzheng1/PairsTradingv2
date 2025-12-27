@@ -415,6 +415,8 @@ class CointegrationAnalyzer:
 @st.cache_data(ttl=DATA_CACHE_TTL)
 def download_stocks(tickers, start_date, end_date):
     """下载股票数据（带缓存）"""
+    import ssl
+    ssl._create_default_https_context = ssl._create_unverified_context
     try:
         data = yf.download(
             tickers, 

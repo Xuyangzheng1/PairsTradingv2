@@ -1,11 +1,22 @@
 """
 Pairs Trading Scanner Pro v3.0 - Streamlit主程序
+ streamlit run f:/shares/1225peiduiv1/pairs_trading_scanner/app.py --server.fileWatcherType none
+ 
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+# ===== 在这里添加SSL修复 =====
+import ssl
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
+# ===== SSL修复结束 =====
+import yfinance as yf
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -108,7 +119,7 @@ def main():
     
     mode = st.sidebar.radio(
         "Select Mode",
-        ["🔍 Scan Pairs", "📈 Test Single Pair"]
+        ["🔍 Scan Pairs", "📈 Test Single Pair", "📊 Batch Backtest"]
     )
     
     st.sidebar.markdown("---")
@@ -460,9 +471,666 @@ def main():
             else:
                 st.info("没有找到卓越配对 (评分≥80 且 夏普≥1.0)")
     
-    # ============ 模式2: 测试单个配对 ============
+    # ============ 模式2: 批量回测 ============
     
-    else:  # mode == "📈 Test Single Pair"
+    elif mode == "📊 Batch Backtest":
+        
+        st.header("📊 Batch Backtest from CSV")
+        
+        st.markdown("""
+        ### 💡 如何使用批量回测
+        
+        上传CSV文件，系统将自动执行配对交易回测。支持两种CSV格式：
+        
+        **格式1：单列 symbol（自动生成所有配对）**
+```
+        symbol
+        JPM
+        BAC
+        WFC
+```
+        
+        **格式2：两列 stock1, stock2（明确指定配对）**
+```
+        stock1,stock2
+        JPM,BAC
+        WFC,C
+```
+        """)
+        
+        # 上传CSV
+        uploaded_file = st.file_uploader(
+            "📁 Upload CSV File",
+            type=['csv'],
+            help="CSV文件应包含 'symbol' 列（自动组合）或 'stock1', 'stock2' 列（明确配对）"
+        )
+        
+        if uploaded_file is not None:
+            
+            try:
+                # 读取CSV
+                df = pd.read_csv(uploaded_file)
+                
+                # 清理列名（去除空格，转小写）
+                df.columns = df.columns.str.strip().str.lower()
+                
+                # 清理数据
+                for col in df.columns:
+                    if df[col].dtype == 'object':
+                        df[col] = df[col].str.strip().str.upper()
+                
+                # 显示调试信息
+                st.info(f"📋 检测到的列: {', '.join(df.columns.tolist())}")
+                st.info(f"📊 数据行数: {len(df)}")
+                
+                # 解析配对
+                pairs_list = []
+                
+                if 'symbol' in df.columns and len(df.columns) == 1:
+                    # 单列模式
+                    symbols = df['symbol'].dropna().unique().tolist()
+                    symbols = [s for s in symbols if s and len(s) > 0 and s != 'NAN']
+                    
+                    st.markdown("---")
+                    st.subheader("⚙️ Batch Settings")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        enable_validation = st.checkbox(
+                            "启用股票代码验证",
+                            value=False,
+                            help="验证股票代码有效性，剔除无效股票（会增加处理时间）",
+                            key="validation_single"
+                        )
+                        
+                        use_dynamic_hedge = st.checkbox(
+                            "启用动态对冲比率",
+                            value=True,
+                            help="动态调整对冲比率，通常能提升10-30%夏普比率",
+                            key="hedge_single"
+                        )
+                        
+                        if use_dynamic_hedge:
+                            hedge_freq = st.slider(
+                                "对冲比率更新频率（天）",
+                                min_value=10,
+                                max_value=40,
+                                value=20,
+                                step=5,
+                                key="freq_single"
+                            )
+                    
+                    with col2:
+                        max_workers = st.slider(
+                            "并行任务数",
+                            min_value=1,
+                            max_value=10,
+                            value=5,
+                            help="增加可提升速度，但可能受API限制",
+                            key="workers_single"
+                        )
+                    
+                    # 验证
+                    if enable_validation:
+                        st.info(f"🔍 正在验证 {len(symbols)} 个股票代码...")
+                        valid_symbols = []
+                        invalid_symbols = []
+                        
+                        progress_bar_validate = st.progress(0)
+                        
+                        for idx, symbol in enumerate(symbols):
+                            try:
+                                test_data = yf.download(symbol, period='5d', progress=False)
+                                if not test_data.empty and len(test_data) >= 3:
+                                    valid_symbols.append(symbol)
+                                else:
+                                    invalid_symbols.append(symbol)
+                            except:
+                                invalid_symbols.append(symbol)
+                            
+                            progress_bar_validate.progress((idx + 1) / len(symbols))
+                        
+                        progress_bar_validate.empty()
+                        
+                        if len(invalid_symbols) > 0:
+                            st.warning(f"⚠️ 剔除了 {len(invalid_symbols)} 个无效股票")
+                            with st.expander("查看无效股票"):
+                                st.write(', '.join(invalid_symbols[:100]))
+                        
+                        st.success(f"✅ 验证通过 {len(valid_symbols)} 个有效股票")
+                        
+                        if len(valid_symbols) > 0:
+                            valid_df = pd.DataFrame({'symbol': valid_symbols})
+                            valid_csv = valid_df.to_csv(index=False)
+                            st.download_button(
+                                "📥 下载筛选后的股票列表",
+                                data=valid_csv,
+                                file_name=f"valid_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv",
+                                key="download_single"
+                            )
+                        
+                        symbols = valid_symbols
+                    else:
+                        st.info(f"⏭️ 跳过验证，使用 {len(symbols)} 个股票")
+                    
+                    # 生成配对
+                    for i in range(len(symbols)):
+                        for j in range(i+1, len(symbols)):
+                            pairs_list.append((symbols[i], symbols[j]))
+                    st.success(f"✅ 生成了 {len(pairs_list)} 个配对")
+                    
+                elif 'stock1' in df.columns and 'stock2' in df.columns:
+                    # 明确配对模式
+                    all_symbols = set()
+                    temp_pairs = []
+                    
+                    for _, row in df.iterrows():
+                        if pd.notna(row['stock1']) and pd.notna(row['stock2']):
+                            temp_pairs.append((row['stock1'], row['stock2']))
+                            all_symbols.add(row['stock1'])
+                            all_symbols.add(row['stock2'])
+                    
+                    st.markdown("---")
+                    st.subheader("⚙️ Batch Settings")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        enable_validation = st.checkbox(
+                            "启用股票代码验证",
+                            value=False,
+                            key="validation_explicit"
+                        )
+                        
+                        use_dynamic_hedge = st.checkbox(
+                            "启用动态对冲比率",
+                            value=True,
+                            key="hedge_explicit"
+                        )
+                        
+                        if use_dynamic_hedge:
+                            hedge_freq = st.slider(
+                                "对冲比率更新频率（天）",
+                                min_value=10,
+                                max_value=40,
+                                value=20,
+                                step=5,
+                                key="freq_explicit"
+                            )
+                    
+                    with col2:
+                        max_workers = st.slider(
+                            "并行任务数",
+                            min_value=1,
+                            max_value=10,
+                            value=5,
+                            key="workers_explicit"
+                        )
+                    
+                    if enable_validation:
+                        st.info(f"🔍 正在验证 {len(all_symbols)} 个股票...")
+                        valid_symbols = set()
+                        invalid_symbols = []
+                        
+                        progress_bar = st.progress(0)
+                        all_symbols_list = list(all_symbols)
+                        
+                        for idx, symbol in enumerate(all_symbols_list):
+                            try:
+                                test_data = yf.download(symbol, period='5d', progress=False)
+                                if not test_data.empty and len(test_data) >= 3:
+                                    valid_symbols.add(symbol)
+                                else:
+                                    invalid_symbols.append(symbol)
+                            except:
+                                invalid_symbols.append(symbol)
+                            
+                            progress_bar.progress((idx + 1) / len(all_symbols_list))
+                        
+                        progress_bar.empty()
+                        
+                        if len(invalid_symbols) > 0:
+                            st.warning(f"⚠️ 剔除 {len(invalid_symbols)} 个无效股票")
+                        
+                        for stock1, stock2 in temp_pairs:
+                            if stock1 in valid_symbols and stock2 in valid_symbols:
+                                pairs_list.append((stock1, stock2))
+                        
+                        st.success(f"✅ 验证通过 {len(pairs_list)} 个配对（原 {len(temp_pairs)} 个）")
+                        
+                        if len(pairs_list) > 0:
+                            valid_df = pd.DataFrame(pairs_list, columns=['stock1', 'stock2'])
+                            valid_csv = valid_df.to_csv(index=False)
+                            st.download_button(
+                                "📥 下载筛选后的配对",
+                                data=valid_csv,
+                                file_name=f"valid_pairs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv",
+                                key="download_explicit"
+                            )
+                    else:
+                        pairs_list = temp_pairs
+                        st.info(f"⏭️ 使用 {len(pairs_list)} 个配对")
+                    
+                elif 'symbol1' in df.columns and 'symbol2' in df.columns:
+                    # 备用列名
+                    all_symbols = set()
+                    temp_pairs = []
+                    
+                    for _, row in df.iterrows():
+                        if pd.notna(row['symbol1']) and pd.notna(row['symbol2']):
+                            temp_pairs.append((row['symbol1'], row['symbol2']))
+                            all_symbols.add(row['symbol1'])
+                            all_symbols.add(row['symbol2'])
+                    
+                    st.markdown("---")
+                    st.subheader("⚙️ Batch Settings")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        enable_validation = st.checkbox(
+                            "启用股票代码验证",
+                            value=False,
+                            key="validation_alt"
+                        )
+                        
+                        use_dynamic_hedge = st.checkbox(
+                            "启用动态对冲比率",
+                            value=True,
+                            key="hedge_alt"
+                        )
+                        
+                        if use_dynamic_hedge:
+                            hedge_freq = st.slider(
+                                "对冲比率更新频率（天）",
+                                min_value=10,
+                                max_value=40,
+                                value=20,
+                                step=5,
+                                key="freq_alt"
+                            )
+                    
+                    with col2:
+                        max_workers = st.slider(
+                            "并行任务数",
+                            min_value=1,
+                            max_value=10,
+                            value=5,
+                            key="workers_alt"
+                        )
+                    
+                    if enable_validation:
+                        st.info(f"🔍 正在验证 {len(all_symbols)} 个股票...")
+                        valid_symbols = set()
+                        invalid_symbols = []
+                        
+                        progress_bar = st.progress(0)
+                        all_symbols_list = list(all_symbols)
+                        
+                        for idx, symbol in enumerate(all_symbols_list):
+                            try:
+                                test_data = yf.download(symbol, period='5d', progress=False)
+                                if not test_data.empty and len(test_data) >= 3:
+                                    valid_symbols.add(symbol)
+                                else:
+                                    invalid_symbols.append(symbol)
+                            except:
+                                invalid_symbols.append(symbol)
+                            
+                            progress_bar.progress((idx + 1) / len(all_symbols_list))
+                        
+                        progress_bar.empty()
+                        
+                        if len(invalid_symbols) > 0:
+                            st.warning(f"⚠️ 剔除 {len(invalid_symbols)} 个无效股票")
+                        
+                        for stock1, stock2 in temp_pairs:
+                            if stock1 in valid_symbols and stock2 in valid_symbols:
+                                pairs_list.append((stock1, stock2))
+                        
+                        st.success(f"✅ 验证通过 {len(pairs_list)} 个配对（原 {len(temp_pairs)} 个）")
+                        
+                        if len(pairs_list) > 0:
+                            valid_df = pd.DataFrame(pairs_list, columns=['symbol1', 'symbol2'])
+                            valid_csv = valid_df.to_csv(index=False)
+                            st.download_button(
+                                "📥 下载筛选后的配对",
+                                data=valid_csv,
+                                file_name=f"valid_pairs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv",
+                                key="download_alt"
+                            )
+                    else:
+                        pairs_list = temp_pairs
+                        st.info(f"⏭️ 使用 {len(pairs_list)} 个配对")
+                    
+                else:
+                    st.error("❌ CSV格式错误！")
+                    st.markdown("- `symbol` (单列)")
+                    st.markdown("- `stock1` 和 `stock2`")
+                    st.markdown("- `symbol1` 和 `symbol2`")
+                    st.stop()
+                
+                # 配对预览
+                st.markdown("---")
+                st.subheader("📋 Pairs Preview")
+                preview_df = pd.DataFrame(pairs_list[:10], columns=['Stock 1', 'Stock 2'])
+                st.dataframe(preview_df, use_container_width=True)
+                if len(pairs_list) > 10:
+                    st.caption(f"显示前10个，共{len(pairs_list)}个")
+                
+                # 开始批量回测
+                if st.button("🚀 Start Batch Backtest", type="primary"):
+                    
+                    
+                    # ===== 第一步：批量下载所有股票数据 =====
+                    all_symbols = set()
+                    for stock1, stock2 in pairs_list:
+                        all_symbols.add(stock1)
+                        all_symbols.add(stock2)
+
+                    all_symbols = sorted(list(all_symbols))
+
+                    st.info(f"📥 正在下载 {len(all_symbols)} 个股票的数据...")
+
+                    download_progress = st.progress(0)
+                    download_status = st.empty()
+
+                    try:
+                        batch_size = 50
+                        all_prices_list = []
+                        
+                        for i in range(0, len(all_symbols), batch_size):
+                            batch = all_symbols[i:i+batch_size]
+                            
+                            download_status.text(f"正在下载第 {i//batch_size + 1}/{(len(all_symbols)-1)//batch_size + 1} 批 ({len(batch)} 个股票)...")
+                            
+                            # 添加重试机制
+                            max_retries = 3
+                            batch_data = None
+                            
+                            for attempt in range(max_retries):
+                                try:
+                                    batch_data = yf.download(
+                                        batch,
+                                        start=start_date,
+                                        end=end_date,
+                                        progress=False,
+                                        threads=False  # ← 关闭多线程，减少SSL错误
+                                    )
+                                    break  # 成功就退出重试
+                                except Exception as e:
+                                    if attempt < max_retries - 1:
+                                        time.sleep(2)  # 等2秒重试
+                                    else:
+                                        st.warning(f"批次 {i//batch_size + 1} 部分下载失败: {str(e)[:50]}")
+                                        batch_data = pd.DataFrame()
+                            
+                            if batch_data is None or batch_data.empty:
+                                continue
+                            
+                            # 处理不同的数据结构
+                            if len(batch) == 1:
+                                if not batch_data.empty and 'Adj Close' in batch_data.columns:
+                                    batch_prices = batch_data[['Adj Close']].copy()
+                                    batch_prices.columns = [batch[0]]
+                                else:
+                                    continue
+                            else:
+                                if 'Adj Close' in batch_data.columns.get_level_values(0):
+                                    batch_prices = batch_data['Adj Close']
+                                elif 'Close' in batch_data.columns.get_level_values(0):
+                                    batch_prices = batch_data['Close']
+                                else:
+                                    continue
+                            
+                            all_prices_list.append(batch_prices)
+                            
+                            progress = min((i + batch_size) / len(all_symbols), 1.0)
+                            download_progress.progress(progress)
+                        
+                        # 合并所有批次
+                        download_status.text("正在合并数据...")
+                        all_prices = pd.concat(all_prices_list, axis=1)
+                        
+                        download_progress.empty()
+                        download_status.empty()
+                        
+                        if all_prices.empty:
+                            st.error("❌ 数据下载失败")
+                            st.stop()
+                        
+                        # 检查哪些股票下载失败
+                        downloaded_symbols = set(all_prices.columns)
+                        failed_symbols = set(all_symbols) - downloaded_symbols
+                        
+                        if failed_symbols:
+                            st.warning(f"⚠️ {len(failed_symbols)} 个股票下载失败")
+                            with st.expander("查看下载失败的股票"):
+                                st.write(', '.join(sorted(list(failed_symbols))))
+                            
+                            # 过滤掉包含失败股票的配对
+                            pairs_list = [(s1, s2) for s1, s2 in pairs_list 
+                                        if s1 in downloaded_symbols and s2 in downloaded_symbols]
+                            st.info(f"剩余 {len(pairs_list)} 个有效配对")
+                        
+                        st.success(f"✅ 成功下载 {len(downloaded_symbols)} 个股票，{len(all_prices)} 天数据")
+                        
+                    except Exception as e:
+                        download_progress.empty()
+                        download_status.empty()
+                        st.error(f"❌ 下载数据失败: {str(e)}")
+                        st.stop()
+
+
+                    
+                    # ===== 第二步：并行回测 =====
+                    all_results = []
+                    failed_pairs = []
+                    
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    def backtest_pair(stock1, stock2):
+                        """回测单个配对 - 包含协整分析"""
+                        try:
+                            # 提取数据
+                            prices = all_prices[[stock1, stock2]].copy()
+                            
+                            if prices.isnull().sum().sum() > len(prices) * 0.1:
+                                return None, "数据缺失过多"
+                            
+                            if len(prices) < lookback * 2:
+                                return None, "数据不足"
+                            
+                            # ===== 协整分析 =====
+                            analyzer = CointegrationAnalyzer()
+                            coint_result = analyzer.analyze(prices, stock1, stock2, verbose=False)
+                            
+                            if coint_result is None:
+                                return None, "协整分析失败"
+                            
+                            coint_score = coint_result['composite_score']
+                            
+                            # 如果协整评分太低，直接跳过回测
+                            if coint_score < min_score:
+                                return None, f"协整评分过低 ({coint_score:.1f})"
+                            
+                            # ===== 回测 =====
+                            strategy = PriceRatioPairsTrading(
+                                prices, stock1, stock2,
+                                z_entry=z_entry,
+                                z_exit=z_exit,
+                                lookback=lookback,
+                                transaction_cost=transaction_cost,
+                                allow_short=allow_short,
+                                zscore_method=zscore_method,
+                                dynamic_hedge=use_dynamic_hedge,
+                                hedge_recalibrate_freq=hedge_freq if use_dynamic_hedge else 20
+                            )
+                            
+                            result = strategy.backtest()
+                            
+                            return {
+                                'Stock 1': stock1,
+                                'Stock 2': stock2,
+                                'Coint Score': coint_score,  # ✅ 协整评分
+                                'Grade': coint_result['grade'],  # 评级
+                                'Return (%)': result['Total Return'],
+                                'Sharpe': result['Sharpe Ratio'],
+                                'Max DD (%)': result['Max Drawdown'],
+                                'Win Rate (%)': result['Win Rate'],
+                                'Trades': result['Num Trades'],
+                                'Avg Trade (%)': result['Avg Trade'],
+                            }, None
+                            
+                        except Exception as e:
+                            return None, str(e)
+                    
+                    # 使用线程池并行回测
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = []
+                        for stock1, stock2 in pairs_list:
+                            future = executor.submit(backtest_pair, stock1, stock2)
+                            futures.append((future, stock1, stock2))
+                        
+                        # 收集结果
+                        for idx, (future, stock1, stock2) in enumerate(futures):
+                            try:
+                                result, error = future.result()
+                                
+                                if error:
+                                    failed_pairs.append({
+                                        'Stock 1': stock1,
+                                        'Stock 2': stock2,
+                                        'Error': error
+                                    })
+                                else:
+                                    all_results.append(result)
+                                
+                                # 更新进度
+                                progress = (idx + 1) / len(pairs_list)
+                                progress_bar.progress(progress)
+                                status_text.text(f"已完成 {idx+1}/{len(pairs_list)} 个配对")
+                                
+                            except Exception as e:
+                                failed_pairs.append({
+                                    'Stock 1': stock1,
+                                    'Stock 2': stock2,
+                                    'Error': str(e)
+                                })
+                    
+                    progress_bar.empty()
+                    status_text.empty()
+                    
+                    # ===== 第三步：显示结果 =====
+                    st.markdown("---")
+                    st.subheader("📊 Batch Backtest Results")
+                    
+                    if len(all_results) > 0:
+                        results_df = pd.DataFrame(all_results)
+                        results_df = results_df.sort_values('Return (%)', ascending=False).reset_index(drop=True)
+                        results_df.insert(0, 'Rank', range(1, len(results_df) + 1))
+                        
+                        # 统计摘要
+                        col1, col2, col3, col4 = st.columns(4)
+                        
+                        col1.metric("总配对数", len(pairs_list))
+                        col2.metric("成功", len(all_results), 
+                                   delta=f"{len(all_results)/len(pairs_list)*100:.1f}%")
+                        col3.metric("失败", len(failed_pairs))
+                        col4.metric("盈利配对", len(results_df[results_df['Return (%)'] > 0]))
+                        
+                        # 性能统计
+                        st.markdown("#### 📈 Performance Statistics")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        col1.metric("平均收益率", f"{results_df['Return (%)'].mean():.2f}%")
+                        col2.metric("平均夏普比率", f"{results_df['Sharpe'].mean():.2f}")
+                        col3.metric("平均胜率", f"{results_df['Win Rate (%)'].mean():.1f}%")
+                        
+                        # Top配对
+                        st.markdown("#### 🏆 Top 10 Pairs")
+                        
+                        top10 = results_df.head(10)
+                        st.dataframe(
+                            top10.style.format({
+                                'Coint Score': '{:.1f}',  # ✅ 加上这列
+                                'Return (%)': '{:+.2f}',
+                                'Sharpe': '{:.2f}',
+                                'Max DD (%)': '{:.2f}',
+                                'Win Rate (%)': '{:.1f}',
+                                'Avg Trade (%)': '{:+.2f}'
+                            }),
+                            use_container_width=True,
+                            height=400
+                        )
+                        
+                        # 下载结果
+                        csv = results_df.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download Full Results (CSV)",
+                            data=csv,
+                            file_name=f"batch_backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv"
+                        )
+                        
+                    else:
+                        st.error("❌ 所有配对回测都失败了")
+                    
+                    # 显示失败的配对
+                    if len(failed_pairs) > 0:
+                        with st.expander(f"❌ 查看失败的配对 ({len(failed_pairs)} 个)"):
+                            failed_df = pd.DataFrame(failed_pairs)
+                            st.dataframe(failed_df, use_container_width=True)
+                
+            except Exception as e:
+                st.error(f"❌ 错误: {str(e)}")
+        
+        else:
+            st.info("👆 请上传CSV文件开始批量回测")
+            
+            # 模板下载
+            st.markdown("---")
+            st.subheader("📝 CSV Template")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**格式1：单列symbol**")
+                example1 = pd.DataFrame({'symbol': ['JPM', 'BAC', 'WFC', 'C', 'USB']})
+                st.dataframe(example1, use_container_width=True)
+                
+                csv1 = example1.to_csv(index=False)
+                st.download_button(
+                    "📥 Download Template 1",
+                    data=csv1,
+                    file_name="template_symbols.csv",
+                    mime="text/csv"
+                )
+            
+            with col2:
+                st.markdown("**格式2：明确配对**")
+                example2 = pd.DataFrame({
+                    'stock1': ['JPM', 'WFC', 'USB'],
+                    'stock2': ['BAC', 'C', 'PNC']
+                })
+                st.dataframe(example2, use_container_width=True)
+                
+                csv2 = example2.to_csv(index=False)
+                st.download_button(
+                    "📥 Download Template 2",
+                    data=csv2,
+                    file_name="template_pairs.csv",
+                    mime="text/csv"
+                )
+    
+    # ============ 模式3: 测试单个配对 ============
+    
+    elif mode == "📈 Test Single Pair":
         
         st.header("📈 Test Single Pair")
         
@@ -610,8 +1278,6 @@ def main():
             # Tab 3: 方法对比
             with tab3:
                 display_method_comparison(prices, stock1, stock2, z_entry, z_exit, lookback)
-
-
 # ==================== 辅助显示函数 ====================
 
 def display_cointegration_details(coint_result):

@@ -30,12 +30,23 @@ def plot_trading_signals(prices_with_indicators, signals_df, stock1, stock2,
     1. 价格比走势 + 买卖点标注
     2. Z-score时间序列 + 阈值线 + 信号点
     3. 两只股票的归一化价格对比
+    
+    兼容动态对冲比率模式
     """
     
     # 检查是否有信号数据
     if signals_df is None or len(signals_df) == 0:
         st.warning("⚠️ 没有交易信号数据，无法生成图表")
         return None
+    
+    # 检查是否有ratio列，如果没有则计算
+    if 'ratio' not in prices_with_indicators.columns:
+        if stock1 in prices_with_indicators.columns and stock2 in prices_with_indicators.columns:
+            prices_with_indicators = prices_with_indicators.copy()
+            prices_with_indicators['ratio'] = prices_with_indicators[stock1] / prices_with_indicators[stock2]
+        else:
+            st.warning("⚠️ 无法计算价格比，缺少股票价格数据")
+            return None
     
     # 创建3个子图
     fig, axes = plt.subplots(3, 1, figsize=figsize)
@@ -114,13 +125,28 @@ def plot_trading_signals(prices_with_indicators, signals_df, stock1, stock2,
     # ===== 图2: Z-score + 阈值线 + 信号点 =====
     ax2 = axes[1]
     
-    # 绘制Z-score曲线
-    ax2.plot(prices_with_indicators.index, 
-             prices_with_indicators['z_score'],
-             label='Z-score', 
-             color=COLORS['z_score'], 
-             alpha=0.8, 
-             linewidth=2)
+    # 检查是否有z_score列
+    if 'z_score' in prices_with_indicators.columns:
+        # 绘制Z-score曲线
+        ax2.plot(prices_with_indicators.index, 
+                 prices_with_indicators['z_score'],
+                 label='Z-score', 
+                 color=COLORS['z_score'], 
+                 alpha=0.8, 
+                 linewidth=2)
+        
+        # 填充区域
+        ax2.fill_between(prices_with_indicators.index, 
+                         2.0, 5.0, 
+                         alpha=0.1, color=COLORS['short_entry'], label='超买区域')
+        ax2.fill_between(prices_with_indicators.index, 
+                         -2.0, -5.0, 
+                         alpha=0.1, color=COLORS['long_entry'], label='超卖区域')
+    else:
+        # 动态对冲比率模式：只显示信号点的Z-score
+        ax2.text(0.5, 0.95, '动态对冲比率模式：Z-score在交易点实时计算', 
+                ha='center', va='top', transform=ax2.transAxes, 
+                fontsize=10, style='italic', color='gray')
     
     # 绘制阈值线
     ax2.axhline(y=2.0, color=COLORS['short_entry'], linestyle='--', alpha=0.6, 
@@ -133,16 +159,8 @@ def plot_trading_signals(prices_with_indicators, signals_df, stock1, stock2,
     
     ax2.axhline(y=0, color='#495057', linestyle='-', alpha=0.4, linewidth=1)
     
-    # 填充区域
-    ax2.fill_between(prices_with_indicators.index, 
-                     2.0, 5.0, 
-                     alpha=0.1, color=COLORS['short_entry'], label='超买区域')
-    ax2.fill_between(prices_with_indicators.index, 
-                     -2.0, -5.0, 
-                     alpha=0.1, color=COLORS['long_entry'], label='超卖区域')
-    
-    # 标注交易信号在Z-score图上
-    if len(long_entries) > 0:
+    # 标注交易信号在Z-score图上（使用signals_df中的z_score）
+    if len(long_entries) > 0 and 'z_score' in long_entries.columns:
         ax2.scatter(long_entries['date'],
                    long_entries['z_score'],
                    color=COLORS['long_entry'], 
@@ -152,7 +170,7 @@ def plot_trading_signals(prices_with_indicators, signals_df, stock1, stock2,
                    edgecolors='darkgreen',
                    linewidth=1.5)
     
-    if len(short_entries) > 0:
+    if len(short_entries) > 0 and 'z_score' in short_entries.columns:
         ax2.scatter(short_entries['date'],
                    short_entries['z_score'],
                    color=COLORS['short_entry'], 
@@ -162,7 +180,7 @@ def plot_trading_signals(prices_with_indicators, signals_df, stock1, stock2,
                    edgecolors='darkred',
                    linewidth=1.5)
     
-    if len(exits) > 0:
+    if len(exits) > 0 and 'z_score' in exits.columns:
         ax2.scatter(exits['date'],
                    exits['z_score'],
                    color=COLORS['exit'], 
@@ -171,7 +189,7 @@ def plot_trading_signals(prices_with_indicators, signals_df, stock1, stock2,
                    zorder=5,
                    linewidth=2.5)
     
-    if len(emergency_exits) > 0:
+    if len(emergency_exits) > 0 and 'z_score' in emergency_exits.columns:
         ax2.scatter(emergency_exits['date'],
                    emergency_exits['z_score'],
                    color=COLORS['emergency_exit'], 
@@ -347,16 +365,44 @@ def plot_traditional_charts(prices, stock1, stock2, strategy, result,
     
     # 2. Z-Score
     ax2 = axes[0, 1]
-    z_scores = strategy.prices['z_score']
-    ax2.plot(z_scores.index, z_scores, linewidth=1.5, alpha=0.8)
+    
+    # 兼容动态对冲比率模式
+    if hasattr(strategy, 'dynamic_hedge') and strategy.dynamic_hedge:
+        # 动态模式：从result['Signals']中提取z_score
+        signals = result.get('Signals', pd.DataFrame())
+        if len(signals) > 0 and 'z_score' in signals.columns:
+            # 过滤掉非交易信号
+            trade_signals = signals[signals['type'].isin(['long_entry', 'short_entry', 'exit', 'emergency_exit'])]
+            if len(trade_signals) > 0:
+                ax2.scatter(trade_signals['date'], trade_signals['z_score'], 
+                           alpha=0.6, s=50, c='steelblue', label='Signal Points')
+                ax2.set_title(f'Z-Score at Trade Signals ({strategy.zscore_method.upper()})', fontweight='bold')
+            else:
+                ax2.text(0.5, 0.5, 'No Trade Signals\n(Dynamic Hedge Mode)', 
+                        ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+                ax2.set_title('Z-Score (Dynamic Hedge Mode)', fontweight='bold')
+        else:
+            ax2.text(0.5, 0.5, 'Z-Score data not available\nin dynamic hedge mode', 
+                    ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+            ax2.set_title('Z-Score (Dynamic Hedge Mode)', fontweight='bold')
+    else:
+        # 固定模式：使用预计算的z_score
+        if 'z_score' in strategy.prices.columns:
+            z_scores = strategy.prices['z_score']
+            ax2.plot(z_scores.index, z_scores, linewidth=1.5, alpha=0.8)
+            ax2.set_title(f'Z-Score ({strategy.zscore_method.upper()})', fontweight='bold')
+        else:
+            ax2.text(0.5, 0.5, 'Z-Score not available', 
+                    ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+            ax2.set_title('Z-Score', fontweight='bold')
+    
+    # 绘制阈值线
     ax2.axhline(y=z_entry, color='r', linestyle='--', label=f'±{z_entry}σ', linewidth=1.5)
     ax2.axhline(y=-z_entry, color='r', linestyle='--', linewidth=1.5)
     ax2.axhline(y=z_exit, color='g', linestyle='--', label=f'±{z_exit}σ', alpha=0.7, linewidth=1.5)
     ax2.axhline(y=-z_exit, color='g', linestyle='--', alpha=0.7, linewidth=1.5)
     ax2.axhline(y=0, color='k', linestyle='-', alpha=0.3)
-    ax2.fill_between(z_scores.index, z_entry, z_entry+1, alpha=0.1, color='red')
-    ax2.fill_between(z_scores.index, -z_entry, -z_entry-1, alpha=0.1, color='red')
-    ax2.set_title(f'Z-Score ({strategy.zscore_method.upper()})', fontweight='bold')
+    
     ax2.set_ylabel('Z-Score')
     ax2.legend()
     ax2.grid(alpha=0.3)
